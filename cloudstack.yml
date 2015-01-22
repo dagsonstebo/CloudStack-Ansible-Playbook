@@ -1,0 +1,374 @@
+---
+#########################################################################################
+#
+# CLOUDSTACK INSTALLATION PLAYBOOK
+#
+# Tags:
+#   - base: Configures NTP, SElinux, CloudStack + EPEL repos, basics
+#   - mysql: Installs, configures and secures MySQL, adds CS specific settings to my.cnf
+#   - mysql3306: Enables MySQL tcp/3306 in iptables.
+#   - csmanagement: Installs and configures CloudStack.
+#   - csmanagementadd: Used on secondary CloudStack management server. 
+#
+#########################################################################################
+
+- name: CloudStack Installation Playbook
+  hosts: all
+  
+  #######################################################################################
+  # Prompt for CloudStack version + passwords
+  #
+  vars_prompt:
+
+    - name: "CSVersion"
+      prompt: "CloudStack version [4.3/4.4]"
+      default: "4.3"
+      private: no
+
+    - name: "MySQLPass"
+      prompt: "MySQL root password"
+      private: yes
+
+    - name: "CloudDBPass"
+      prompt: "Cloud DB password"
+      private: yes
+
+  #######################################################################################
+  # Vars
+  #
+  vars:
+    NTPServers:
+      - 0.uk.pool.ntp.org
+      - 1.uk.pool.ntp.org
+      - 2.uk.pool.ntp.org
+      - 3.uk.pool.ntp.org
+
+    CSMySQL:
+      MySQLRoot: root
+      CloudDBUser: cloud
+      CloudDBHost: localhost
+      MaxConnections: 700
+      BindAddress: 0.0.0.0
+
+    CSManagement:
+      ManagementIP: 172.16.152.5
+      SecondaryMount: /secondary
+      NFSHost: 172.16.152.4
+      NFSSecondaryShare: /exports/cloudsecondary1 
+      SysTemplateURLurl43: http://download.cloud.com/templates/4.3/systemvm64template-2014-06-23-master-xen.vhd.bz2
+      SysTemplateURLurl44: http://cloudstack.apt-get.eu/systemvm/4.4/systemvm64template-4.4.1-7-kvm.qcow2.bz2 
+      SysTemplateURLhv: xenserver
+      VhdutilURL: http://download.cloud.com.s3.amazonaws.com/tools/vhd-util
+
+  #######################################################################################
+  # Tasks
+  #
+  tasks:
+
+    #######################################################
+    # Validate CS version and passwords
+    #
+    - name: Validate input - CloudStack version 
+      fail: msg="Incorrect CloudStack version."
+      when: CSVersion not in [ "4.3", "4.4" ]
+      tags:
+        - csmanagement
+
+    - name: Validate input - MySQL password
+      fail: msg="Missing or incorrect MySQL password."
+      when: MySQLPass is not defined or ( MySQLPass is defined and MySQLPass  == "" )
+      tags:
+        - mysql
+
+    - name: Validate input - cloud DB password
+      fail: msg="Missing or incorrect cloud DB password."
+      when: CloudDBPass is not defined or ( CloudDBPass is defined and CloudDBPass  == "" )
+      tags:
+        - csmanagement
+        - csmanagementadd
+    
+    #######################################################
+    # Fail if not ran on CentOS
+    # Delete or comment out to bypass.
+    #
+    - name: Check guest OS version
+      fail: msg="WARNING - CloudStack playbook written for CentOS (OS detected {{ ansible_distribution }})."
+      when: ansible_distribution != "CentOS" 
+      tags:
+        - base
+        - mysql
+        - csmanagement
+        - csmanagementadd
+
+    #######################################################
+    # Configure NTP
+    #
+    - name: Install NTP
+      yum: name=ntp state=present
+      tags:
+        - ntp
+        - base
+
+    - name: Configure NTP file
+      template: src=templates/ntp.conf.j2 dest=/etc/ntp.conf
+      notify: restart ntp
+      tags:
+        - ntp
+        - base
+
+    - name: Start the NTP daemon
+      service: name=ntpd state=started enabled=true
+      tags:
+        - ntp
+        - base
+
+    #######################################################
+    # Configure SElinux settings
+    #
+    - name: Set SELinux to permissive
+      selinux: policy=targeted state=permissive
+      tags:
+        - selinux
+        - base
+
+    #######################################################
+    #  Configure CloudStack yum repo
+    #
+    - name: Configure CloudStack repo
+      template: src=templates/cloudstack.repo.j2 dest=/etc/yum.repos.d/cloudstack.repo mode=0644
+      tags:
+        - base
+        - yumrepo
+  
+    #######################################################
+    #  Install additional RPMs: EPEL repo, python-pip 
+    #  (required for cloudmonkey), vim
+    #
+    - name: Install EPEL repo / python-pip / vim
+      yum: name={{ item }} state=present
+      with_items:
+        - epel-release
+        - python-pip
+        - vim
+      tags:
+        - epelrepo
+        - base
+
+    #######################################################
+    # Install and configure MySQL
+    #
+    - name: Install MySQL server
+      yum: name=mysql-server state=present
+      tags:
+        - mysql
+  
+    - name: Install MySQL python module
+      yum: name=MySQL-python state=present
+      tags:
+        - mysql
+
+    #######################################################
+    #  Append CloudStack specific settings to my.cnf
+    #
+    - name: Append CloudStack specific settings to my.cnf
+      lineinfile: dest=/etc/my.cnf
+                  insertbefore="^\[mysqld_safe\]"
+                  line="# CloudStack MySQL settings\\ninnodb_rollback_on_timeout=1\\ninnodb_lock_wait_timeout=600\\nmax_connections={{ CSMySQL.MaxConnections }}\\nlog-bin=mysql-bin\\nbinlog-format = \\'ROW\\'\\nbind-address={{ CSMySQL.BindAddress }}\\n"
+                  state=present
+      tags:
+        - mysql
+    
+    #######################################################
+    # Start MySQL
+    #
+    - name: Start the MySQL daemon
+      service: name=mysqld state=started enabled=true
+      tags:
+        - mysql
+    
+    #######################################################
+    # mysql_secure_installation
+    #
+    - name: Remove anonymous MySQL user for {{ ansible_hostname }}
+      action: mysql_user user="" host="{{ ansible_hostname }}" state="absent"
+      tags:
+        - mysql
+        - securemysql
+
+    - name: Remove anonymous MySQL user for {{ ansible_fqdn }}
+      action: mysql_user user="" host="{{ ansible_fqdn }}" state="absent"
+      tags:
+        - mysql
+        - securemysql
+
+    - name: Remove anonymous MySQL user for localhost
+      action: mysql_user user="" state="absent"
+      tags:
+        - mysql
+        - securemysql
+
+    - name: Remove the MySQL test DB
+      action: mysql_db db=test state=absent
+      tags:
+        - mysql
+        - securemysql
+
+    - name: Secure MySQL installation / change root user password
+      mysql_user: login_user=root
+                  login_password=''
+                  name=root
+                  password={{ MySQLPass | mandatory }} 
+                  priv=*.*:ALL,GRANT
+                  host={{ item }}
+      with_items:
+        - "{{ ansible_hostname }}"
+        - "{{ ansible_fqdn }}"
+        - 127.0.0.1
+        - ::1
+        - localhost
+      tags:
+        - mysql
+        - securemysql
+
+    #######################################################
+    # Open iptables port 3306, use when MySQL on separate server
+    #
+    - name: Open MySQL tcp 3306
+      shell: iptables -A INPUT -p tcp -m tcp --dport 3306 -j ACCEPT
+      notify: 
+        - save iptables
+      tags:
+        - mysql3306
+
+
+    ########################################################
+    # Install CloudStack Management server
+    #
+    - name: Confirm CloudStack installation
+      debug: msg="Installing CloudStack {{ CSVersion | mandatory }}"
+      tags:
+        - csmanagement
+        - csmanagementadd
+
+    - name: Install CloudStack management server
+      yum: name=cloudstack-management state=present
+      tags:
+        - csmanagement
+        - csmanagementadd
+
+    #######################################################
+    # Install vhd-util on management server
+    #
+    - name: Download vhd-util for Xenserver hypervisors
+      get_url: url={{ CSManagement.VhdutilURL }} dest={{ item }} mode=0755
+      with_items:
+        - /usr/share/cloudstack-common/scripts/vm/hypervisor/xenserver/
+        - /usr/share/cloudstack-common/scripts/vm/hypervisor/xenserver/xenserver60/
+        - /usr/share/cloudstack-common/scripts/vm/hypervisor/xenserver/xenserver62/
+      tags:
+        - csmanagement
+        - csmanagementadd
+        - vhdutil
+
+    #######################################################
+    # Install cloudmonkey
+    #
+    - name: Install CloudMonkey
+      shell: pip install cloudmonkey
+      tags:
+        - csmanagement
+        - csmanagementadd
+        - cloudmonkey
+
+    #######################################################
+    # Configure CloudStack DB
+    #
+    - name: Configure CloudStack database connectvity
+      shell: cloudstack-setup-databases {{ CSMySQL.CloudDBUser }}:{{ CloudDBPass | mandatory }}@{{ CSMySQL.CloudDBHost }} --deploy-as={{ CSMySQL.MySQLRoot }}:{{ MySQLPass | mandatory }} -i {{ CSManagement.ManagementIP  }}>> /root/cs_dbinstall.out 2>&1
+      tags:
+        - csmanagement
+
+    #######################################################
+    # Configure CloudStack DB on additional management server
+    #
+    - name: Configure CloudStack database connectvity on additional management server
+      shell: cloudstack-setup-databases {{ CSMySQL.CloudDBUser }}:{{ CloudDBPass | mandatory }}@{{ CSMySQL.CloudDBHost }} -i {{ CSManagement.ManagementIP  }}>> /root/cs_dbinstall.out 2>&1
+      tags:
+        - csmanagementadd
+
+    #######################################################
+    # Configure Management server
+    - name: Configure CloudStack management server
+      shell: cloudstack-setup-management >> /root/cs_mgmtinstall.out 2>&1
+      tags:
+        - csmanagement
+        - csmanagementadd
+
+    #######################################################
+    # Mount secondary NFS share and install system VM 
+    # template. Check size of mounted folder before 
+    # installation to ensure previous data not being
+    # overwritten.
+    #
+    - name: Mount NFS secondary storage
+      mount: name={{ CSManagement.SecondaryMount }} src={{ CSManagement.NFSHost }}:{{ CSManagement.NFSSecondaryShare}} fstype=nfs state=mounted
+      tags:
+        - csmanagement
+        - secstorage
+    
+    - name: Check size of mounted secondary storage template folder
+      shell: du {{ CSManagement.SecondaryMount }}/template/ --max-depth=0 | awk '{print $1}'
+      register: TemplateFolderSize
+      tags:
+        - csmanagement
+        - secstorage
+        - SysTemplateURLtest
+  
+    #######################################################
+    # Download and install CS43 system VM template
+    #
+    - name: Download CloudStack 4.3 system VM template
+      shell: /usr/share/cloudstack-common/scripts/storage/secondary/cloud-install-sys-tmplt -m {{ CSManagement.SecondaryMount }} -u {{ CSManagement.SysTemplateURLurl43 }} -h {{ CSManagement.SysTemplateURLhv }} -F
+      when: TemplateFolderSize.stdout|int < 1024 and CSVersion == "4.3"
+      tags:
+        - csmanagement
+        - secstorage
+        - SysTemplateURL
+
+    #######################################################
+    # Download and install CS44 system VM template
+    #
+    - name: Download CloudStack 4.4 system template
+      shell: /usr/share/cloudstack-common/scripts/storage/secondary/cloud-install-sys-tmplt -m {{ CSManagement.SecondaryMount }} -u {{ CSManagement.SysTemplateURLurl44 }} -h {{ CSManagement.SysTemplateURLhv }} -F
+      when: TemplateFolderSize.stdout|int < 1024 and CSVersion == "4.4"
+      tags:
+        - csmanagement
+        - secstorage
+        - SysTemplateURL
+
+    #######################################################
+    # Unmount NFS share
+    #
+    - name: Umount NFS secondary storage
+      mount: name={{ CSManagement.SecondaryMount }} src={{ CSManagement.NFSHost }}:{{ CSManagement.NFSSecondaryShare}} fstype=nfs state=absent
+      tags:
+        - csmanagement
+        - secstorage
+  
+  #########################################################################################
+  # CloudStack handlers
+  #
+  handlers:  
+
+    # NTP restart
+    - name: restart ntp
+      service: name=ntpd state=restarted
+
+    # Iptables restart
+    - name: restart iptables
+      service: name=iptables state=restarted
+
+    # Save iptables
+    - name: save iptables
+      shell: /sbin/service iptables save
+      notify: restart iptables
