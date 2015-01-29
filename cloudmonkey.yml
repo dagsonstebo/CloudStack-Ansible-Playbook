@@ -1,0 +1,272 @@
+---
+#########################################################################################
+# Copyright 2015 Dag Sonstebo
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#########################################################################################
+#
+# CLOUDMONKEY CONFIGURATION PLAYBOOK
+#
+# Used following CloudStack base install, playbook uses Cloudmonkey to configure
+# zone, networks, pods, clusters, XenServer hosts and primary/secondary storage. 
+# 
+# Prereqs and network topology:
+#   - Fully built and running CloudStack management server.
+#   - Built XenServer hosts, with cloud-private and cloud-public networks configured.
+#   - Prepared NFS primary and secondary storage.
+#   - VLAN segregation.
+#   - Physical network 1: management and private traffic, tagged cloud-private.
+#   - Physical network 2: public traffic, tagged cloud-public.
+#
+# Update variables and run with:
+#
+# ansible-playbook -i <inventory_file> --limit=<target_host> cloudmonkey.yml
+#
+# Playbook will prompt for:
+#   - XenServer host password
+# 
+# v1.0 280115 DS
+#########################################################################################
+# 
+- name: apply CloudStack configuration to all nodes
+  hosts: all
+  
+  #########################################################################################
+  # Vars and vars_prompt
+  #  
+  vars_prompt:
+
+    - name: "XSPassword"
+      prompt: "XenServer root password"
+      private: yes
+
+  vars:
+
+    CMConfig:
+      NFSHost: <NFS_hostname_or_IP_address_here>
+      NFSSecondaryShare: <NFS_secondary_storage_share_here> 
+      NFSPrimaryShare: <NFS_primary_storage_share_here> 
+      PrimaryStoreName: <NFS_primary_storage_name_here>
+      ZoneName: <Zone_name>
+      PublicDNS1: <Public_DNS_IP_1>
+      PublicDNS2: <Public_DNS_IP_2>
+      InternalDNS1: <Private_DNS_IP_1>
+      InternalDNS2: <Private_DNS_IP_2>
+      GuestCIDR: 10.0.1.0/24
+      NetworkType: Advanced
+      Phys1Name: <Physical_network_1_name>
+      Phys1Isolation: VLAN
+      Phys1VLANs: <Private_traffic_VLAN_range>
+      Phys1TrafficType1: Management
+      Phys1TrafficType1Label: cloud-private
+      Phys1TrafficType2: Guest
+      Phys1TrafficType2Label: cloud-private
+      Phys2Name: <Physical_network_2_name>
+      Phys2Isolation: VLAN
+      Phys2VLANs: <Public_traffic_VLAN_or_blank>
+      Phys2TrafficType1: Public
+      Phys2TrafficType1Label: cloud-public
+      PodName: <Pod_name>
+      PodStartIP: <Pod_management_IP_range_start_IP>
+      PodEndIP: <Pod_management_IP_range_end_IP>
+      PodNetmask: <Pod_management_netmask>
+      PodGateway: <Pod_management_default_gateway>
+      PublicStartIP: <Public_IP_range_start_IP>
+      PublicEndIP: <Public_IP_range_end_IP>
+      PublicNetmask: <Public_netmask>
+      PublicGateway: <Public_default_gateway>
+      ClusterName: <Cluster_name>
+      ClusterHypervisor: XenServer
+      XSHostIP: <First_XenServer_host_IP>
+      XSUsername: root
+  
+  #########################################################################################
+  # Tasks
+  #
+  tasks:
+
+    - name: Validate input - XenServer host password
+      fail: msg="Missing or incorrect XenServer password."
+      when: XSPassword is not defined or ( XSPassword is defined and XSPassword  == "" )
+      tags:
+        - cmconfig
+
+    #######################################################
+    # Configure first zone
+    #
+    - name: Configure zone and add resources
+      shell: cloudmonkey create zone name={{ CMConfig.ZoneName }} dns1={{ CMConfig.PublicDNS1 }} dns2={{ CMConfig.PublicDNS2 }} internaldns1={{ CMConfig.InternalDNS1 }} internaldns2={{ CMConfig.InternalDNS2 }} guestcidraddress={{ CMConfig.GuestCIDR }} networktype={{ CMConfig.NetworkType }} localstorageenabled=false | grep ^id | awk '{print $3}'
+      register: ZoneID
+      tags:
+        - cmconfig
+  
+    #######################################################
+    # Create first physical network and traffic types
+    #
+    - name: Create physical network 1
+      shell:  cloudmonkey create physicalnetwork name={{ CMConfig.Phys1Name }} zoneid={{ ZoneID.stdout }} isolationmethods={{ CMConfig.Phys1Isolation }} vlan={{ CMConfig.Phys1VLANs }} | grep ^id | awk '{print $3}'
+      register: Phys1ID
+      tags:
+        - cmconfig
+  
+    - name: Create traffic type on physical network 1 ({{ CMConfig.Phys1TrafficType1 }})
+      shell: cloudmonkey add traffictype physicalnetworkid={{ Phys1ID.stdout }} traffictype={{ CMConfig.Phys1TrafficType1 }} xennetworklabel={{ CMConfig.Phys1TrafficType1Label }}
+      tags:
+        - cmconfig
+
+    - name: Create traffic type on physical network 1 ({{ CMConfig.Phys1TrafficType2 }})
+      shell: cloudmonkey add traffictype physicalnetworkid={{ Phys1ID.stdout }} traffictype={{ CMConfig.Phys1TrafficType2 }} xennetworklabel={{ CMConfig.Phys1TrafficType2Label }}
+      tags:
+        - cmconfig
+    
+    #######################################################
+    # Configure VR, VPC VR, LB VM
+    #
+    - name: Get network service provider ID for VR
+      shell: cloudmonkey list networkserviceproviders name=VirtualRouter physicalnetworkid={{ Phys1ID.stdout }} | grep ^id | awk '{print $3}'
+      register: Phys1VRID
+      tags:
+        - cmconfig
+
+    - name: Get VR element
+      shell: cloudmonkey list virtualrouterelements nspid={{ Phys1VRID.stdout }} | grep ^id | awk '{print $3}'
+      register: Phys1VRElement
+      tags:
+        - cmconfig
+
+    - name: Enable VR
+      shell: cloudmonkey api configureVirtualRouterElement enabled=true id={{ Phys1VRElement.stdout }}
+      tags:             
+        - cmconfig
+
+    - name: Enable network service provider
+      shell: cloudmonkey update networkserviceprovider state=Enabled id={{ Phys1VRID.stdout }}
+      tags:
+        - cmconfig
+
+    - name: Get network service provider ID VPCR
+      shell: cloudmonkey list networkserviceproviders name=VpcVirtualRouter physicalnetworkid={{ Phys1ID.stdout }} | grep ^id | awk '{print $3}'
+      register: Phys1VPCVRID
+      tags:
+        - cmconfig
+
+    - name: Get virtual VPC router element
+      shell: cloudmonkey list virtualrouterelements nspid={{ Phys1VPCVRID.stdout }} | grep ^id | awk '{print $3}'
+      register: Phys1VPCVRElement
+      tags:
+        - cmconfig
+  
+    - name: Enable VPC VR
+      shell: cloudmonkey api configureVirtualRouterElement enabled=true id={{ Phys1VPCVRElement.stdout }}
+      tags:             
+        - cmconfig
+  
+    - name: Enable network service provider
+      shell: cloudmonkey update networkserviceprovider state=Enabled id={{ Phys1VPCVRID.stdout }}
+      tags:
+        - cmconfig
+
+    - name: Get network service provider ID LBVM
+      shell: cloudmonkey list networkserviceproviders name=InternalLbVm physicalnetworkid={{ Phys1ID.stdout }} | grep ^id | awk '{print $3}'
+      register: Phys1LBVMID
+      tags:
+        - cmconfig
+
+    - name: Get LBVM element
+      shell: cloudmonkey list internalloadbalancerelements nspid={{ Phys1LBVMID.stdout }} | grep ^id | awk '{print $3}'
+      register: Phys1LBVMVRElement
+      tags:
+        - cmconfig
+
+    - name: Enable LBVM
+      shell: cloudmonkey configure internalloadbalancerelement id={{ Phys1LBVMVRElement.stdout }} enabled=true 
+      tags:             
+        - cmconfig
+
+    - name: Enable network service provider LBVM
+      shell: cloudmonkey update networkserviceprovider state=Enabled id={{ Phys1LBVMID.stdout }}
+      tags:
+        - cmconfig
+
+    - name: Enable physical network 1
+      shell: cloudmonkey update physicalnetwork state=Enabled id={{ Phys1ID.stdout }}
+      tags:
+        - cmconfig
+
+    #######################################################
+    # Create physical network 2 and traffic type
+    #
+    - name: Create physical network 2
+      shell:  cloudmonkey create physicalnetwork name={{ CMConfig.Phys2Name }} zoneid={{ ZoneID.stdout }} isolationmethods={{ CMConfig.Phys2Isolation }} vlan={{ CMConfig.Phys2VLANs }} | grep ^id | awk '{print $3}'
+      register: Phys2ID
+      tags:
+        - cmconfig
+
+    - name: Create traffic type on physical network 2 ({{ CMConfig.Phys2TrafficType1 }})
+      shell: cloudmonkey add traffictype physicalnetworkid={{ Phys2ID.stdout }} traffictype={{ CMConfig.Phys2TrafficType1 }} xennetworklabel={{ CMConfig.Phys2TrafficType1Label }}
+      tags:
+        - cmconfig
+
+    - name: Add public network 
+      shell: cloudmonkey create vlaniprange zoneid={{ ZoneID.stdout }}  startip={{ CMConfig.PublicStartIP }}  endip={{ CMConfig.PublicEndIP }} netmask={{ CMConfig.PublicNetmask }} forvirtualnetwork=true gateway={{ CMConfig.PublicGateway }}  physicalnetworkid={{ Phys2ID.stdout }}
+      tags:
+        - cmconfig
+
+    - name: Enable physical network 2
+      shell: cloudmonkey update physicalnetwork state=Enabled id={{ Phys2ID.stdout }}
+      tags:
+        - cmconfig
+
+    ########################################################
+    # Create pod and cluster
+    #
+    - name: Create pod in zone 1
+      shell: cloudmonkey create pod name={{ CMConfig.PodName }} startip={{ CMConfig.PodStartIP }} endip={{ CMConfig.PodEndIP }} netmask={{ CMConfig.PodNetmask }} gateway={{ CMConfig.PodGateway }}  zoneid={{ ZoneID.stdout }} | grep ^id | awk '{print $3}'
+      register: PodID
+      tags:
+        - cmconfig
+
+    - name: Add cluster in zone 1 / pod 1
+      shell: cloudmonkey add cluster podid={{ PodID.stdout }} hypervisor={{ CMConfig.ClusterHypervisor }} clustertype=CloudManaged zoneid={{ ZoneID.stdout }} clustername={{ CMConfig.ClusterName }} | grep ^id | awk '{print $3}'
+      register: ClusterID
+      tags:
+        - cmconfig
+
+    - name: Add XS host
+      shell: cloudmonkey add host zoneid={{ ZoneID.stdout }} podid={{ PodID.stdout }}  clusterid={{ ClusterID.stdout }} hypervisor={{ CMConfig.ClusterHypervisor }} username={{ CMConfig.XSUsername }} password={{ XSPassword | mandatory }}  url=http://{{ CMConfig.XSHostIP }}
+      tags:
+        - cmconfig
+
+    #######################################################
+    # Add primary storage
+    #
+    - name: Add primary storage
+      shell: cloudmonkey create storagepool zoneid={{ ZoneID.stdout }} podid={{ PodID.stdout }} clusterid={{ ClusterID.stdout }} name={{ CMConfig.PrimaryStoreName }}  provider=nfs url=nfs://{{ CMConfig.NFSHost }}{{ CMConfig.NFSPrimaryShare }}
+      tags:
+        - cmconfig
+
+    #######################################################
+    # Add secondary storage
+    #
+    - name: Add secondary storage
+      shell: cloudmonkey add secondarystorage zoneid={{ ZoneID.stdout }} url=nfs://{{ CMConfig.NFSHost }}{{ CMConfig.NFSSecondaryShare }}
+      tags:
+        - cmconfig
+    
+    #######################################################
+    # Enable zone
+    - name: Enable zone
+      shell: cloudmonkey update zone allocationstate=Enabled id={{ ZoneID.stdout }}
+      tags:
+        - cmconfig
+
